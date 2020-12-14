@@ -1,0 +1,212 @@
+## Mopsgeschwindigkeit
+
+Der Code in `slow-sim.R` implementiert eine (relativ sinnbefreite) Simulationsstudie um die Verteilung der geschätzten Regressionskoeffizienten $\hat\beta$ in einem Modell 
+$y \sim t(\text{ncp}= X \beta, \text{df}=4)$ mit $t(4)$-verteilten Fehlern und
+linearem Prädiktor $X \beta$ zu bestimmen:
+```{r, slow_sim}
+source("slow-sim.R")
+
+set.seed <- 232323
+
+observations <- 5000
+covariates <- 10
+
+testdata <- as.data.frame(
+  matrix(rnorm(observations * covariates),
+         nrow = observations
+  ))
+
+system.time(test <- simulate(reps = 100, seed = 20141028, data = testdata))
+```
+Die Simulation ist recht ineffizient programmiert.
+
+a) Benutzen Sie die in der Vorlesung kennengelernten Profiling-Methoden um die Stellen zu identifizieren an denen das Skript in `slow-sim.R` die meiste Zeit verbringt. 
+```{r}
+########################################3
+## a)
+#####
+# function to simulate linear regression with t-distributed random errors
+
+# Inputs are:
+# -number of replications (reps)
+# -seed for replication (seed)  (seed is needed because of rt in simulate response)
+# -data to analyze
+# -the true coefs from 0:ncol(data) and df for the degrees of freedom for the t-dist.
+# Output are the estimated coefs and the corresponding seed
+simulate <- function(reps, seed, data, true_coef = 0:ncol(data), df = 4) {
+  set.seed(seed)
+  coefs <- NULL
+  for (rep in seq_len(reps)) {
+    coefs <- cbind(coefs, simulate_once(data, true_coef, df))
+  }
+  # most time needed in this loop, because everything is called inside.
+  return(structure(coefs, seed = seed))
+}
+
+simulate_once <- function(data, true_coef, df) {
+  data <- simulate_response(data, true_coef, df)
+  estimate_coef(data)
+}
+# estimate coef takes almost the double of the time as the generation of the observed y
+
+simulate_response <- function(data, true_coef, df) {
+  design <- model.matrix(~ ., data = data)
+  expected <- design %*% true_coef
+  data[["y"]] <- expected + rt(nrow(data), df = df)
+  data
+}
+# big problem in this snipped is that we build the model.matrix in each rep, but it is the same for all simulations. 
+# The only thing that changes is the error of y. Idea: Setup expected outside the loop.
+# not really slow but can be faster
+
+estimate_coef <- function(data) {
+  model <- lm(y ~ ., data = data)
+  unname(coef(model))
+}
+# Takes the most time in the loop. lm() does a lot (R^2 and other stuff) in the background and we only need coefs.
+# So we also don't have to use unname and coef(model) (unnecessary)
+# better use the vectorised form (t(x)*x)^-1 * t(x)*y which gives us the coefs directly.
+```
+
+
+b) Modifizieren Sie den Code in `slow-sim.R` so, dass er i) **mindestens 5x schneller** läuft (ohne dass sich die Ergebnisse qualitativ ändern!!) und ii) unseren Vorstellungen von sauber dokumentierter, gut strukturierter und defensiv programmierter Software entspricht.
+
+## Turbomodus
+```{r, sim turbo}
+########################################3
+## b) 
+#####
+
+# Inputs are:
+# -number of replications (reps)
+# -seed for replication (seed)  (seed is needed because of rt in simulate response)
+# -data to analyze
+# -the true coefs from 0:ncol(data) and df for the degrees of freedom for the t-dist.
+# Output are the estimated coefs and the corresponding seed
+
+simulate_fast <- function(reps, seed, data, true_coef = 0:ncol(data), df = 4) {
+  set.seed(seed)
+  
+  # input checks
+  checkmate::assert_number(x = reps, lower = 1, finite = TRUE)
+  checkmate::assert_number(x = seed,  finite = TRUE)
+  checkmate::assert_number(x = df, lower = 1, finite = TRUE)
+  checkmate::assert_numeric(x = true_coef, min.len = 1, finite = TRUE)
+  checkmate::assert(checkmate::check_data_frame(data, any.missing = FALSE, min.rows = 1, min.cols = 1),
+                    checkmate::check_matrix(data, any.missing = FALSE, min.rows = 1, min.cols = 1), combine = "or")
+  # homogen inputs
+  if (checkmate::test_data_frame(data)) data <- as.matrix(data, )
+  
+  # Same for all simulations. Only the error of y changes.
+  number_of_rows <- nrow(data)
+  design <- cbind(rep(1, number_of_rows), as.matrix(data))
+  product_sum_matrix <- t(design) %*% design
+  inverse_product_sum_matrix <- solve(product_sum_matrix)
+  part_coef <- inverse_product_sum_matrix %*% t(design)   # (t(x) * x)^-1 * t(x)
+  expected_response <- design %*% true_coef
+  
+  coefs <- matrix(0, nrow = length(true_coef), ncol = reps) # pre allocation
+  
+  for (rep in seq_len(reps)) {
+    coefs[,rep] <- simulate_once_fast(part_coef, number_of_rows, expected_response, df)  
+  }
+  return(structure(coefs, seed = seed))
+}
+
+simulate_once_fast <- function(part_coef, number_of_rows, expected_response,  df) {
+  observed_response <- simulate_response_fast(number_of_rows, expected_response, df)
+  estimate_coef_fast(part_coef, observed_response)
+}
+
+simulate_response_fast <- function(number_of_rows, expected_response, df) {
+  expected_response + rt(number_of_rows, df = df)
+}
+
+estimate_coef_fast <- function(part_coef, observed_response) {
+  part_coef %*% observed_response
+}
+
+system.time(test <- simulate_fast(reps = 100, seed = 20141028, data = testdata))
+```
+
+```{r, benchmark check}
+bench::mark("slow" = simulate(reps = 100, seed = 20141028, data = testdata),
+            "turbo" = simulate_fast(reps = 100, seed = 20141028, data = testdata),
+            relative = TRUE)
+```
+ Output sind gleich da keine Fehlermeldung. Turbo ist wirklich Turbo!
+
+## Parallelisierung 
+```{r, Parallelisierung Setup}
+library(foreach)
+library(doRNG)
+
+parallel_foreach_simulate_fast <- function(reps, seed, data, true_coef = 0:ncol(data), df = 4){
+  
+  set.seed(seed)
+  
+  # input checks
+  checkmate::assert_number(x = reps, lower = 1, finite = TRUE)
+  checkmate::assert_number(x = seed,  finite = TRUE)
+  checkmate::assert_number(x = df, lower = 1, finite = TRUE)
+  checkmate::assert_numeric(x = true_coef, min.len = 1, finite = TRUE)
+  checkmate::assert(checkmate::check_data_frame(data, any.missing = FALSE, min.rows = 1, min.cols = 1),
+                    checkmate::check_matrix(data, any.missing = FALSE, min.rows = 1, min.cols = 1), combine = "or")
+  # homogen inputs
+  if (checkmate::test_data_frame(data)) data <- as.matrix(data)
+  
+  # Same for all simulations
+  number_of_rows <- nrow(data)
+  design <- cbind(rep(1, number_of_rows), as.matrix(data))
+  product_sum_matrix <- t(design) %*% design
+  inverse_product_sum_matrix <- solve(product_sum_matrix)
+  part_coef <- inverse_product_sum_matrix %*% t(design)   # (t(x) * x)^-1 * t(x)
+  expected_response <- design %*% true_coef
+  
+  coefs <- 
+    foreach::foreach(rep = seq_len(reps), .combine = "cbind") %dorng% {
+        simulate_once_fast(part_coef, number_of_rows, expected_response,  df)
+    }
+  
+  return(structure(coefs[, ], seed = seed))
+}
+
+doParallel::registerDoParallel(cores = parallel::detectCores() - 1)
+```
+
+```{r , rbenchmark check }
+rbenchmark::benchmark(simulate_fast(reps = 100, seed = 20141028, data = testdata),
+                      parallel_foreach_simulate_fast(reps = 100, seed = 20141028, data = testdata), 
+                      replications = 10, columns = c("test", "elapsed", "relative"),
+                      order = "elapsed")
+```
+Mal so mal so. Hmmm komisch. Hab eigentlich 16 Cores, warum ist Parallelisierung nicht wenigstens doppelt so schnell?
+Ergebnisse stimmen trotz 'dorng' nicht ueberein. Sind zwar bei parallel_foreach jedesmal gleich aber halt nicht wie bei simulate_fast :(
+
+```{r , microbench}
+microbenchmark::microbenchmark(
+  simulate(
+    reps = 200,
+    seed = 20141028,
+    data = testdata
+  ),
+  simulate_fast(
+    reps = 200,
+    seed = 20141028,
+    data = testdata
+  ),
+ parallel_foreach_simulate_fast(
+    reps = 200,
+    seed = 20141028,
+    data = testdata
+  ),
+  times = 2
+)
+```
+Hier ist Parallelisierung schneller. Funktioniert wohl doch, je mehr reps desto besser/schneller wird parallel_foreach. 
+Trotzdem Ergebnisse nicht identisch. Hat vll was mit dem seed in foreach zu tun.
+Frage: Was uebersehe ich hier?
+
+*Hinweis:* Betrachten Sie zu a) sowohl wo in dem Code von `slow-sim.R`  die meiste Zeit verbraucht wird als auch welche *eingebauten* R-Funktionen dort aufgerufen werden und was diese tun und wie.  
+Für b) sollten Sie sich zuerst mal überlegen was man hier eigentlich tun will ("First, solve the problem. Then, write the code.") um dann kritisch auf den Code zu gucken: Wo tut er mehr als er eigentlich muss? Wo wiederholt sich Schritte überflüssigerweise? Können Sie Berechnungen vektorisieren oder Zuweisungen prä-allozieren?  
+Wenn Sie den Code in b) schön effizient gemacht haben versuchen Sie auch noch ihn (möglichst: plattformunabhängig) zu parallelisieren, mit einem Paket Ihrer Wahl. (Obacht: `future` funktioniert nicht unbedingt verläßlich in RStudio, benutzen Sie da zum Testen eine normale R-Konsole....)
